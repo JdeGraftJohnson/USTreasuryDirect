@@ -1,0 +1,63 @@
+name: Treasury Auction Monitor
+
+on:
+  schedule:
+    # Auctions typically close at 1:00 PM ET (18:00 UTC)
+    # Run at 18:30 and 19:30 UTC Mon–Fri to catch results + any late updates
+    - cron: '30 18 * * 1-5'
+    - cron: '30 19 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Auction date (YYYY-MM-DD, default: today)'
+        required: false
+      force:
+        description: 'Force alert even if data unchanged'
+        required: false
+        default: 'false'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Treasury monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          DATE_ARG=""
+          FORCE_ARG=""
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            DATE_ARG="--date ${{ github.event.inputs.date }}"
+          fi
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            FORCE_ARG="--force"
+          fi
+          python treasury_monitor.py $DATE_ARG $FORCE_ARG
+
+      - name: Commit auction data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add treasury_current.json treasury_previous.json 2>/dev/null || true
+          git diff --staged --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: update treasury auction data [skip ci]"
+          git pull --rebase origin main
+          git push
