@@ -1,13 +1,16 @@
 """
-treasury_monitor.py — US Treasury auction monitor for GitHub Actions.
+treasury_monitor.py — US Treasury auction monitor using FiscalData API.
 
-Automatically selects the most recent auction date from auction_schedule.py.
-No manual date input needed — just run it.
+Switched from TreasuryDirect TA_WS (blocks GitHub IPs) to:
+  https://api.fiscaldata.treasury.gov/services/api/fiscal_service/
+
+No API key required. Full docs:
+  https://fiscaldata.treasury.gov/api-documentation/
 
 Run:
     python treasury_monitor.py              # auto date
     python treasury_monitor.py --preview    # send upcoming schedule to Discord
-    python treasury_monitor.py --force      # alert even if data unchanged
+    python treasury_monitor.py --force      # alert even if unchanged
 """
 
 import argparse
@@ -15,7 +18,7 @@ import hashlib
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
@@ -26,68 +29,109 @@ from auction_schedule import (
     upcoming_auctions,
 )
 
-TREASURY_API  = "https://www.treasurydirect.gov/TA_WS/securities/search"
+# ── FiscalData API ─────────────────────────────────────────────────────────
+# Endpoint: /v1/accounting/od/auctions_query
+# Docs: https://fiscaldata.treasury.gov/datasets/treasury-securities-auctions-data/
+#
+# Key fields returned:
+#   auction_date, security_type, security_term, offering_amt,
+#   total_tendered, total_accepted, bid_to_cover_ratio,
+#   direct_bidder_accepted, indirect_bidder_accepted, primary_dealer_accepted,
+#   high_rate, high_yield, issue_date
+
+FISCALDATA_BASE = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
+AUCTION_ENDPOINT = f"{FISCALDATA_BASE}/v1/accounting/od/auctions_query"
+
 CURRENT_FILE  = Path("treasury_current.json")
 PREVIOUS_FILE = Path("treasury_previous.json")
 
-TYPE_EMOJI = {"BILL": "💵", "NOTE": "📄", "BOND": "🏛️", "TIPS": "📊", "FRN": "🔄"}
+TYPE_EMOJI = {"Bill": "💵", "Note": "📄", "Bond": "🏛️", "TIPS": "📊", "FRN": "🔄"}
 
 
 # ── Fetch ──────────────────────────────────────────────────────────────────
 
 def fetch_auctions(auction_date: str) -> list[dict]:
+    """
+    Fetch auction results from FiscalData for a given date.
+    FiscalData field names use snake_case and title-case type values.
+    """
     scheduled = get_scheduled(auction_date)
-    sec_types = list(dict.fromkeys(t for _, t in scheduled))
+    if not scheduled:
+        return []
+
+    # Get unique security types scheduled (title-case to match FiscalData)
+    type_map = {"BILL": "Bill", "NOTE": "Note", "BOND": "Bond", "TIPS": "TIPS", "FRN": "FRN"}
+    sec_types = list(dict.fromkeys(type_map.get(t, t) for _, t in scheduled))
+
     results = []
     for sec_type in sec_types:
         try:
             resp = requests.get(
-                TREASURY_API,
-                params={"startDate": auction_date, "endDate": auction_date, "type": sec_type},
+                AUCTION_ENDPOINT,
+                params={
+                    "filter": f"auction_date:eq:{auction_date},security_type:eq:{sec_type}",
+                    "sort":   "-auction_date",
+                    "page[size]": "50",
+                    "format": "json",
+                },
                 headers={"User-Agent": "TreasuryMonitor/1.0"},
                 timeout=15,
             )
             resp.raise_for_status()
             data = resp.json()
-            if isinstance(data, list):
-                results.extend(data)
-                print(f"  Fetched {len(data)} {sec_type}(s)")
-            elif isinstance(data, dict) and data:
-                results.append(data)
-                print(f"  Fetched 1 {sec_type}")
+            records = data.get("data", [])
+            results.extend(records)
+            print(f"  Fetched {len(records)} {sec_type}(s) from FiscalData")
+        except requests.HTTPError as e:
+            print(f"  HTTP error {sec_type}: {e}")
         except Exception as e:
             print(f"  Error {sec_type}: {e}")
+
     return results
 
 
 # ── Parse ──────────────────────────────────────────────────────────────────
 
 def _f(v) -> float:
+    """Safely convert FiscalData string value to float."""
     try:
-        return float(v) if v not in (None, "", "null") else 0.0
+        return float(v) if v not in (None, "", "null", "NULL") else 0.0
     except (ValueError, TypeError):
         return 0.0
+
 
 def _pct(part: float, whole: float) -> float:
     return round(part / whole * 100, 1) if whole > 0 else 0.0
 
+
 def parse_auction(raw: dict) -> dict:
-    term     = raw.get("securityTerm", raw.get("term", "Unknown"))
-    sec_type = raw.get("securityType", raw.get("type", ""))
-    offering       = _f(raw.get("offeringAmount"))
-    total_tendered = _f(raw.get("totalTendered"))
-    total_accepted = _f(raw.get("totalAccepted"))
-    direct_acc     = _f(raw.get("directBidderAccepted"))
-    indirect_acc   = _f(raw.get("indirectBidderAccepted"))
-    dealer_acc     = _f(raw.get("primaryDealerAccepted"))
-    high_rate      = _f(raw.get("highDiscountRate") or raw.get("highYield"))
-    btc            = _f(raw.get("bidToCoverRatio"))
+    """
+    Parse a FiscalData auction record.
+    FiscalData field reference:
+      security_type, security_term, auction_date, issue_date
+      offering_amt, total_tendered, total_accepted
+      bid_to_cover_ratio, high_rate, high_yield
+      direct_bidder_accepted, indirect_bidder_accepted, primary_dealer_accepted
+    """
+    term     = raw.get("security_term", "Unknown")
+    sec_type = raw.get("security_type", "")
+
+    offering       = _f(raw.get("offering_amt"))
+    total_tendered = _f(raw.get("total_tendered"))
+    total_accepted = _f(raw.get("total_accepted"))
+    direct_acc     = _f(raw.get("direct_bidder_accepted"))
+    indirect_acc   = _f(raw.get("indirect_bidder_accepted"))
+    dealer_acc     = _f(raw.get("primary_dealer_accepted"))
+    # Bills use high_rate (discount rate), Notes/Bonds use high_yield
+    high_rate      = _f(raw.get("high_rate") or raw.get("high_yield"))
+    btc            = _f(raw.get("bid_to_cover_ratio"))
+
     return {
         "label":            f"{term} {sec_type}",
         "security_term":    term,
         "security_type":    sec_type,
-        "auction_date":     raw.get("auctionDate", ""),
-        "issue_date":       raw.get("issueDate", ""),
+        "auction_date":     raw.get("auction_date", ""),
+        "issue_date":       raw.get("issue_date", ""),
         "offering_m":       offering,
         "total_tendered_m": total_tendered,
         "total_accepted_m": total_accepted,
@@ -142,6 +186,7 @@ def send_discord_results(auctions: list[dict], auction_date: str, upcoming: list
     if not webhook_url:
         print("No DISCORD_WEBHOOK_URL — skipping.")
         return
+
     fields = []
     for a in auctions:
         emoji = TYPE_EMOJI.get(a["security_type"], "📋")
@@ -157,17 +202,21 @@ def send_discord_results(auctions: list[dict], auction_date: str, upcoming: list
             f"🏦 Primary Dealer:     {fmt(a['dealer']['accepted_m'])}  `{a['dealer']['pct']}%`"
         )
         fields.append({"name": f"{emoji} {a['label']}", "value": value, "inline": False})
+
     if upcoming:
         lines = []
         for d, items in upcoming[:3]:
             day = datetime.strptime(d, "%Y-%m-%d").strftime("%a %b %d")
             lines.append(f"**{day}:** {', '.join(f'{t} {s}' for t,s in items)}")
         fields.append({"name": "📅 Coming Up", "value": "\n".join(lines), "inline": False})
+
     embed = {
         "title": f"🏛️ US Treasury Auction Results — {auction_date}",
         "color": 0x1E90FF,
         "fields": fields,
-        "footer": {"text": f"TreasuryDirect  •  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"},
+        "footer": {
+            "text": f"FiscalData.treasury.gov  •  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        },
     }
     resp = requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
     resp.raise_for_status()
@@ -202,14 +251,13 @@ def main():
     parser.add_argument("--preview", action="store_true")
     args = parser.parse_args()
 
-    today = datetime.now(timezone.utc).date().isoformat()
+    today    = datetime.now(timezone.utc).date().isoformat()
     upcoming = upcoming_auctions(from_date=today, days=4)
 
     if args.preview:
         send_discord_preview(upcoming, today)
         return
 
-    # Auto-select — no date input needed
     auction_date = most_recent_auction_date()
     if not auction_date:
         print("No scheduled auction dates found in the past 7 days.")
@@ -218,17 +266,23 @@ def main():
     scheduled = get_scheduled(auction_date)
     print(f"Auto-selected: {auction_date}")
     print(f"Scheduled:     {', '.join(f'{t} {s}' for t,s in scheduled)}")
+    print(f"API:           FiscalData (api.fiscaldata.treasury.gov)")
 
-    raw = fetch_auctions(auction_date)
+    raw     = fetch_auctions(auction_date)
     if not raw:
-        print("No results yet — auction results post after 1:00 PM ET.")
+        print("No results yet — FiscalData posts results after auction settles (~1PM ET).")
         sys.exit(0)
 
-    parsed = [parse_auction(r) for r in raw]
+    parsed  = [parse_auction(r) for r in raw]
 
     for a in parsed:
-        print(f"  {a['label']}: BTC {a['bid_to_cover']:.2f}x | Rate {a['high_rate_pct']:.3f}% | "
-              f"Direct {a['direct']['pct']}% Indirect {a['indirect']['pct']}% Dealer {a['dealer']['pct']}%")
+        print(
+            f"  {a['label']}: BTC {a['bid_to_cover']:.2f}x | "
+            f"Rate {a['high_rate_pct']:.3f}% | "
+            f"Direct {a['direct']['pct']}% "
+            f"Indirect {a['indirect']['pct']}% "
+            f"Dealer {a['dealer']['pct']}%"
+        )
 
     dataset = {
         "fetched_at":   datetime.now(timezone.utc).isoformat(),
