@@ -2,17 +2,26 @@ name: Treasury Auction Monitor
 
 on:
   schedule:
-    # Auctions typically close at 1:00 PM ET (18:00 UTC)
-    # Run at 18:30 and 19:30 UTC Mon–Fri to catch results + any late updates
-    - cron: '30 18 * * 1-5'
-    - cron: '30 19 * * 1-5'
+    # Auctions close at 1:00 PM ET = 18:00 UTC (17:00 UTC summer/EDT)
+    # Run at 18:30 UTC Mon–Thu to catch results (Bills run Mon/Tue/Wed/Thu)
+    # Run again at 19:30 UTC as backup for late postings
+    - cron: '30 18 * * 1-4'
+    - cron: '30 19 * * 1-4'
+
+    # Monday morning preview (8AM ET = 13:00 UTC) — upcoming week schedule
+    - cron: '0 13 * * 1'
+
   workflow_dispatch:
     inputs:
       date:
-        description: 'Auction date (YYYY-MM-DD, default: today)'
+        description: 'Auction date YYYY-MM-DD (default: today)'
         required: false
       force:
-        description: 'Force alert even if data unchanged'
+        description: 'Force Discord alert even if data unchanged (true/false)'
+        required: false
+        default: 'false'
+      preview:
+        description: 'Send upcoming schedule preview only (true/false)'
         required: false
         default: 'false'
 
@@ -42,15 +51,21 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          DATE_ARG=""
-          FORCE_ARG=""
+          ARGS=""
           if [ -n "${{ github.event.inputs.date }}" ]; then
-            DATE_ARG="--date ${{ github.event.inputs.date }}"
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
           fi
           if [ "${{ github.event.inputs.force }}" = "true" ]; then
-            FORCE_ARG="--force"
+            ARGS="$ARGS --force"
           fi
-          python treasury_monitor.py $DATE_ARG $FORCE_ARG
+          if [ "${{ github.event.inputs.preview }}" = "true" ]; then
+            ARGS="$ARGS --preview"
+          fi
+          # Monday 13:00 UTC scheduled run = weekly preview
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%H:%M)" = "13:00" ]; then
+            ARGS="$ARGS --preview"
+          fi
+          python treasury_monitor.py $ARGS
 
       - name: Commit auction data
         run: |
