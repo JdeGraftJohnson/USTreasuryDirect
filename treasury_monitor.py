@@ -171,17 +171,20 @@ def rotate_and_save(dataset: dict) -> bool:
 # ── Formatting ─────────────────────────────────────────────────────────────
 
 def fmt(v: float) -> str:
-    """Format million-dollar values as human-readable strings.
-    FiscalData returns amounts already in millions (e.g. 90000 = $90 billion).
+    """Format raw dollar amounts as human-readable strings.
+    FiscalData returns actual dollar values (e.g. 89000000000 = $89 billion).
     """
     if v == 0:
         return "$0"
-    if v >= 1_000_000:
-        return f"${v/1_000_000:.1f} trillion"
-    if v >= 1_000:
-        n = v / 1_000
+    if v >= 1_000_000_000_000:
+        return f"${v/1_000_000_000_000:.1f} trillion"
+    if v >= 1_000_000_000:
+        n = v / 1_000_000_000
         return f"${n:.0f} billion" if n == int(n) else f"${n:.1f} billion"
-    return f"${v:.0f} million"
+    if v >= 1_000_000:
+        n = v / 1_000_000
+        return f"${n:.0f} million" if n == int(n) else f"${n:.1f} million"
+    return f"${v:,.0f}"
 
 def btc_label(btc: float) -> str:
     if btc >= 2.5: return "🟢 Strong"
