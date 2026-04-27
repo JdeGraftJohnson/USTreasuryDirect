@@ -132,6 +132,7 @@ def parse_auction(raw: dict) -> dict:
         "security_type":    sec_type,
         "auction_date":     raw.get("auction_date", ""),
         "issue_date":       raw.get("issue_date", ""),
+        "maturity_date":    raw.get("maturity_date", ""),
         "offering_m":       offering,
         "total_tendered_m": total_tendered,
         "total_accepted_m": total_accepted,
@@ -170,7 +171,17 @@ def rotate_and_save(dataset: dict) -> bool:
 # ── Formatting ─────────────────────────────────────────────────────────────
 
 def fmt(v: float) -> str:
-    return f"${v/1000:.2f}B" if v >= 1000 else f"${v:.0f}M"
+    """Format million-dollar values as human-readable strings.
+    FiscalData returns amounts already in millions (e.g. 90000 = $90 billion).
+    """
+    if v == 0:
+        return "$0"
+    if v >= 1_000_000:
+        return f"${v/1_000_000:.1f} trillion"
+    if v >= 1_000:
+        n = v / 1_000
+        return f"${n:.0f} billion" if n == int(n) else f"${n:.1f} billion"
+    return f"${v:.0f} million"
 
 def btc_label(btc: float) -> str:
     if btc >= 2.5: return "🟢 Strong"
@@ -191,7 +202,14 @@ def send_discord_results(auctions: list[dict], auction_date: str, upcoming: list
     for a in auctions:
         emoji = TYPE_EMOJI.get(a["security_type"], "📋")
         btc   = a["bid_to_cover"]
+        # Format dates nicely: 2026-04-27 → Apr 27, 2026
+        def _fmtdate(d):
+            try: return datetime.strptime(d, "%Y-%m-%d").strftime("%b %d, %Y")
+            except: return d or "—"
+        auction_dt  = _fmtdate(a["auction_date"])
+        maturity_dt = _fmtdate(a["maturity_date"])
         value = (
+            f"📅 **Auction:** {auction_dt}  |  **Matures:** {maturity_dt}\n"
             f"**Offered:** {fmt(a['offering_m'])}  "
             f"**Tendered:** {fmt(a['total_tendered_m'])}\n"
             f"**Bid-to-Cover:** `{btc:.2f}x`  {btc_label(btc)}\n"
